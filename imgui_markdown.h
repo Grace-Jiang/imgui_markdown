@@ -45,6 +45,7 @@ imgui_markdown currently supports the following markdown functionality:
  - Link
  - Image
  - Horizontal rule
+ - Table
 
 Syntax
 
@@ -82,6 +83,18 @@ Image:
 Horizontal Rule:
 ***
 ___
+
+Table:
+| Column 1 | Column 2 | Column 3 |
+|----------|:--------:|---------:|
+| Left     | Center   | Right    |
+| Data     | Data     | Data     |
+
+Tables are rendered using ImGui tables. Column alignment is supported:
+- Left align: `|:------|` or `|:---`
+- Center align: `|:------:|` or `|:---:`
+- Right align: `|------:|` or `|---:`
+The separator row (second row) must contain at least three dashes in each cell.
 
 ===============================================================================
 
@@ -218,6 +231,11 @@ ___
   * Unordered lists
     * Lists can be indented with two extra spaces.
   * Lists can have [links like this one to Avoyd](https://www.avoyd.com/) and *emphasized text*
+## H2 Header: Table
+| Column 1 | Column 2 | Column 3 |
+|----------|:--------:|---------:|
+| Left     | Center   | Right    |
+| Data     | Data     | Data     |
 )";
     Markdown( markdownText );
 }
@@ -227,6 +245,8 @@ ___
 
 
 #include <stdint.h>
+#include <vector>
+#include <string>
 
 namespace ImGui
 {
@@ -273,6 +293,7 @@ namespace ImGui
          UNORDERED_LIST,
          LINK,
          EMPHASIS,
+         TABLE,
     };
 
     struct MarkdownFormatInfo
@@ -343,8 +364,15 @@ namespace ImGui
 
     struct TextRegion;
     struct Line;
+
+    struct TableColumn;
+    struct Table;
+
     inline void UnderLine( ImColor col_ );
     inline void RenderLine( const char* markdown_, Line& line_, TextRegion& textRegion_, const MarkdownConfig& mdConfig_ );
+    inline bool IsTableRow( const char* lineStart, const char* lineEnd );
+    inline void ParseTableRow( const char* markdown_, int lineStart, int lineEnd, std::vector<TableColumn>& columns );
+    inline void RenderTable( const Table& table, const char* markdown_, TextRegion& textRegion_, const MarkdownConfig& mdConfig_ );
 
     struct TextRegion
     {
@@ -419,6 +447,30 @@ namespace ImGui
         TextBlock url;
         bool isImage = false;
         int num_brackets_open = 0;
+    };
+
+    struct TableColumn
+    {
+        TextBlock cell;              // Cell text block
+        enum Alignment {
+            LEFT,
+            CENTER,
+            RIGHT,
+        };
+        Alignment alignment = LEFT;
+    };
+
+    struct Table
+    {
+        enum TableState {
+            NO_TABLE,
+            TABLE_HEADER,
+            TABLE_ROW,
+        };
+        TableState state = NO_TABLE;
+        std::vector<TableColumn> columns;  // Header columns
+        std::vector<std::vector<TableColumn>> rows;  // Data rows
+        int lineStart = 0;
     };
 
 	struct Emphasis {
@@ -516,6 +568,7 @@ namespace ImGui
         Line        line;
         Link        link;
         Emphasis    em;
+        Table       table;
         TextRegion  textRegion;
 
         char c = 0;
@@ -789,6 +842,46 @@ namespace ImGui
                 {
                     ImGui::Separator();
                 }
+                else if( IsTableRow( markdown_ + line.lineStart, markdown_ + i ) )
+                {
+                    // Handle table row
+                    if( table.state == Table::NO_TABLE )
+                    {
+                        // Start a new table
+                        table.state = Table::TABLE_HEADER;
+                        table.lineStart = line.lineStart;
+                        ParseTableRow( markdown_, line.lineStart, i, table.columns );
+                    }
+                    else if( table.state == Table::TABLE_HEADER )
+                    {
+                        // Second row - separator row (alignments)
+                        std::vector<TableColumn> separatorColumns;
+                        ParseTableRow( markdown_, line.lineStart, i, separatorColumns );
+
+                        // Update alignment for header columns
+                        for( size_t j = 0; j < table.columns.size() && j < separatorColumns.size(); ++j )
+                        {
+                            table.columns[j].alignment = separatorColumns[j].alignment;
+                        }
+
+                        // Move to table row state
+                        table.state = Table::TABLE_ROW;
+                    }
+                    else if( table.state == Table::TABLE_ROW )
+                    {
+                        // Additional data row
+                        std::vector<TableColumn> rowColumns;
+                        ParseTableRow( markdown_, line.lineStart, i, rowColumns );
+                        table.rows.push_back( rowColumns );
+                    }
+                }
+                else if( table.state != Table::NO_TABLE )
+                {
+                    // End of table, render it
+                    RenderTable( table, markdown_, textRegion, mdConfig_ );
+                    table = Table();
+                    RenderLine( markdown_, line, textRegion, mdConfig_ );
+                }
                 else
                 {
                     // render the line: multiline emphasis requires a complex implementation so not supporting
@@ -824,7 +917,15 @@ namespace ImGui
                 {
                     --line.lineEnd;
                 }
-                RenderLine( markdown_, line, textRegion, mdConfig_ );
+                if( table.state != Table::NO_TABLE )
+                {
+                    // Render table at end of document
+                    RenderTable( table, markdown_, textRegion, mdConfig_ );
+                }
+                else
+                {
+                    RenderLine( markdown_, line, textRegion, mdConfig_ );
+                }
             }
         }
 
@@ -1013,6 +1114,254 @@ namespace ImGui
         }
 
 
+    inline bool IsTableRow( const char* lineStart, const char* lineEnd )
+    {
+        // A table row must start and end with | and contain at least one pipe in between
+        if( lineEnd <= lineStart )
+        {
+            return false;
+        }
+
+        // Skip leading whitespace
+        const char* start = lineStart;
+        while( start < lineEnd && ( *start == ' ' || *start == '\t' ) )
+        {
+            ++start;
+        }
+
+        // Must start with |
+        if( start >= lineEnd || *start != '|' )
+        {
+            return false;
+        }
+
+        // Check if there's at least one more | in the line
+        bool foundPipe = false;
+        for( const char* p = start + 1; p < lineEnd; ++p )
+        {
+            if( *p == '|' )
+            {
+                foundPipe = true;
+                break;
+            }
+        }
+
+        return foundPipe;
+    }
+
+    inline void ParseTableRow( const char* markdown_, int lineStart, int lineEnd, std::vector<TableColumn>& columns )
+    {
+        columns.clear();
+
+        const char* lineStr = markdown_ + lineStart;
+        int lineLength = lineEnd - lineStart;
+
+        // Skip leading whitespace
+        const char* start = lineStr;
+        while( start < lineStr + lineLength && ( *start == ' ' || *start == '\t' ) )
+        {
+            ++start;
+        }
+
+        // Skip leading | if present
+        if( start < lineStr + lineLength && *start == '|' )
+        {
+            ++start;
+        }
+
+        // Parse cells
+        const char* cellStart = start;
+        const char* cellEnd = start;
+
+        while( cellStart < lineStr + lineLength )
+        {
+            TableColumn column;
+
+            // Find the end of the cell (next | or end of line)
+            cellEnd = cellStart;
+            while( cellEnd < lineStr + lineLength && *cellEnd != '|' )
+            {
+                ++cellEnd;
+            }
+
+            // Trim trailing whitespace
+            const char* cellTextEnd = cellEnd;
+            while( cellTextEnd > cellStart && ( *(cellTextEnd - 1) == ' ' || *(cellTextEnd - 1) == '\t' ) )
+            {
+                --cellTextEnd;
+            }
+
+            column.cell.start = lineStart + (cellStart - lineStr);
+            column.cell.stop = lineStart + (cellTextEnd - lineStr);
+
+            // Determine alignment from separator row
+            const char* sepStart = cellStart;
+            const char* sepEnd = cellEnd;
+            bool isSeparatorRow = true;
+
+            // Check if this is a separator row (contains only dashes, colons, spaces, and pipes)
+            for( const char* p = cellStart; p < cellEnd; ++p )
+            {
+                if( *p != '-' && *p != ' ' && *p != '\t' && *p != ':' )
+                {
+                    isSeparatorRow = false;
+                    break;
+                }
+            }
+
+            if( isSeparatorRow && cellEnd > cellStart )
+            {
+                // Parse alignment from separator
+                bool leftColon = ( cellStart < cellEnd && *cellStart == ':' );
+                bool rightColon = ( cellEnd > cellStart && *(cellEnd - 1) == ':' );
+
+                if( leftColon && rightColon )
+                {
+                    column.alignment = TableColumn::CENTER;
+                }
+                else if( rightColon )
+                {
+                    column.alignment = TableColumn::RIGHT;
+                }
+                else
+                {
+                    column.alignment = TableColumn::LEFT;
+                }
+            }
+            else
+            {
+                // Data cell, default to left alignment
+                column.alignment = TableColumn::LEFT;
+            }
+
+            columns.push_back( column );
+
+            // Move to next cell
+            cellStart = cellEnd + 1;
+        }
+    }
+
+    inline void RenderTable( const Table& table, const char* markdown_, TextRegion& textRegion_, const MarkdownConfig& mdConfig_ )
+    {
+        if( table.columns.empty() )
+        {
+            return;
+        }
+
+        MarkdownFormatInfo formatInfo;
+        formatInfo.config = &mdConfig_;
+        formatInfo.type = MarkdownFormatType::TABLE;
+
+        // Start table formatting
+        mdConfig_.formatCallback( formatInfo, true );
+
+        // Calculate column counts
+        size_t numCols = table.columns.size();
+
+        // Create table
+        if( ImGui::BeginTable( "markdown_table", (int)numCols, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV ) )
+        {
+            // Setup columns with proper alignment
+            for( size_t i = 0; i < numCols; ++i )
+            {
+                TableColumn::Alignment align = table.columns[i].alignment;
+
+                ImGuiTableColumnFlags flags = ImGuiTableColumnFlags_WidthFixed;
+                ImGui::TableSetupColumn( "", flags, 0.0f );
+            }
+
+            // Render header row
+            ImGui::TableHeadersRow();
+            for( size_t col = 0; col < numCols; ++col )
+            {
+                ImGui::TableSetColumnIndex( (int)col );
+                const TableColumn& column = table.columns[col];
+
+                if( column.cell.stop > column.cell.start )
+                {
+                    const char* cellText = markdown_ + column.cell.start;
+                    const char* cellTextEnd = markdown_ + column.cell.stop;
+
+                    // Calculate text width and available width
+                    float text_width = ImGui::CalcTextSize( cellText, cellTextEnd ).x;
+                    float available_width = ImGui::GetContentRegionAvail().x;
+
+                    // Apply alignment by setting cursor position
+                    switch( column.alignment )
+                    {
+                        case TableColumn::CENTER:
+                            ImGui::SetCursorPosX( ImGui::GetCursorPosX() + (available_width - text_width) * 0.5f );
+                            break;
+                        case TableColumn::RIGHT:
+                            ImGui::SetCursorPosX( ImGui::GetCursorPosX() + available_width - text_width );
+                            break;
+                        case TableColumn::LEFT:
+                        default:
+                            // Default position
+                            break;
+                    }
+
+                    // Render text with wrapping disabled for aligned cells (use a very large wrap position)
+                    ImGui::PushTextWrapPos( -1.0f );
+                    ImGui::TextUnformatted( cellText, cellTextEnd );
+                    ImGui::PopTextWrapPos();
+                }
+            }
+
+            // Render data rows
+            for( size_t row = 0; row < table.rows.size(); ++row )
+            {
+                ImGui::TableNextRow();
+                const std::vector<TableColumn>& rowColumns = table.rows[row];
+
+                for( size_t col = 0; col < numCols; ++col )
+                {
+                    ImGui::TableSetColumnIndex( (int)col );
+
+                    if( col < rowColumns.size() )
+                    {
+                        const TableColumn& column = rowColumns[col];
+
+                        if( column.cell.stop > column.cell.start )
+                        {
+                            const char* cellText = markdown_ + column.cell.start;
+                            const char* cellTextEnd = markdown_ + column.cell.stop;
+
+                            // Calculate text width and available width
+                            float text_width = ImGui::CalcTextSize( cellText, cellTextEnd ).x;
+                            float available_width = ImGui::GetContentRegionAvail().x;
+
+                            // Apply alignment by setting cursor position
+                            switch( column.alignment )
+                            {
+                                case TableColumn::CENTER:
+                                    ImGui::SetCursorPosX( ImGui::GetCursorPosX() + (available_width - text_width) * 0.5f );
+                                    break;
+                                case TableColumn::RIGHT:
+                                    ImGui::SetCursorPosX( ImGui::GetCursorPosX() + available_width - text_width );
+                                    break;
+                                case TableColumn::LEFT:
+                                default:
+                                    // Default position
+                                    break;
+                            }
+
+                            // Render text with wrapping disabled for aligned cells (use a very large wrap position)
+                            ImGui::PushTextWrapPos( -1.0f );
+                            ImGui::TextUnformatted( cellText, cellTextEnd );
+                            ImGui::PopTextWrapPos();
+                        }
+                    }
+                }
+            }
+
+            ImGui::EndTable();
+        }
+
+        // End table formatting
+        mdConfig_.formatCallback( formatInfo, false );
+    }
+
     inline void defaultMarkdownFormatCallback( const MarkdownFormatInfo& markdownFormatInfo_, bool start_ )
     {
         switch( markdownFormatInfo_.type )
@@ -1121,6 +1470,9 @@ namespace ImGui
                     ImGui::UnderLine( ImGui::GetStyle().Colors[ ImGuiCol_Button ] );
                 }
             }
+            break;
+        case MarkdownFormatType::TABLE:
+            // No special formatting needed for tables by default
             break;
         }
     }
